@@ -31,10 +31,21 @@ If you run this script as user the only thing you need is to have the correct ri
 
 ```powershell
 .\UserToSharedMail -Email prenom.nom@domain.com `
-                   -TenantID "See Overview -> Directory (tenant) ID"
-                   -ClientID "See Overview -> Application (client) ID"
-                   -ClientSecret "See Certificates & secrets -> Value (can only be seen at the creation of the secret)"
-                   -ProxyFilter "^(smtp:|SMTP:).*@domain\.(com|fr)"
+                   -ProxyFilter "^(smtp:|SMTP:).*@domain\.(com|fr)" `
                    -FullAccessEmails a.b@domain.com, c.d@domain.com `
-                   -ReviewerEmails e.f@domain.com, g.h@domain.com
+                   -ReviewerEmails e.f@domain.com, g.h@domain.com `
+                   -MaxWaitMinutes 30 `
+                   -DeleteAD `
+```
+
+You can use the `-WhatIf` parameter to see what the would do:
+
+```powershell
+.\UserToSharedMail -Email prenom.nom@domain.com `
+                   -ProxyFilter "^(smtp:|SMTP:).*@domain\.(com|fr)" `
+                   -FullAccessEmails a.b@domain.com, c.d@domain.com `
+                   -ReviewerEmails e.f@domain.com, g.h@domain.com `
+                   -MaxWaitMinutes 30 `
+                   -DeleteAD `
+                   -WhatIf
 ```
