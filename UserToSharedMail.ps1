@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    Transfere the personal mailbox of a deleted user to a shared mailbox.
+    Transfer the personal mailbox of a deleted user to a shared mailbox.
 
 .DESCRIPTION
-    Transfere the personal mailbox of a deleted user to a shared mailbox.
+    Transfer the personal mailbox of a deleted user to a shared mailbox.
     The default behavior of Microsoft is to delete the shared mailbox linked to
     a user if the user is deleted. This scripts allows the shared mailbox to
     stay active even after the user is deleted.
