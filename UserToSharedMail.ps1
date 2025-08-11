@@ -17,6 +17,7 @@
 .PARAMETER ProxyFilter
     A string filter (regex) to select which proxy addresses from the user's mailbox to retain and apply to the new shared mailbox.
     Only proxy addresses matching this filter will be copied.
+    Defaults to ".*" (include all proxy addresses).
 
 .PARAMETER FullAccessEmails
     An array of email addresses to grant Full Access mailbox permissions.
@@ -29,7 +30,22 @@
     Default is 30 minutes.
 
 .PARAMETER DeleteAD
-    Wether the Active Directory user should be deleted during the migration process.
+    If true the Active Directory user should be deleted during the migration process.
+
+.PARAMETER Archive
+    If true, the script will archive the mailbox by creating a shared mailbox 
+    and restoring the deleted mailbox contents into it.
+
+.PARAMETER RedirectEmail
+    An email address to which future mail for the mailbox will be forwarded.
+    Can be internal or external depending on the value of -RedirectExternal.
+
+.PARAMETER RedirectExternal
+    If true, treats the -RedirectEmail as an external email address 
+    and sets ForwardingSMTPAddress instead of ForwardingAddress.
+
+.PARAMETER DeliverToMailboxAndForward
+    If true, retains copies of forwarded emails in the original shared mailbox.
 
 .PARAMETER WhatIf
     Shows what actions would be performed without actually executing them.
@@ -55,16 +71,20 @@
     https://learn.microsoft.com/en-us/powershell/module/exchange/ (Exchange Online cmdlets)
     https://learn.microsoft.com/en-us/powershell/module/activedirectory/ (Active Directory module)
 #>
+[CmdletBinding(SupportsShouldProcess=$true)]
 param (
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [String]$Email,
-    [String]$ProxyFilter,
+    [String]$ProxyFilter = ".*",
     [String[]]$FullAccessEmails,
     [String[]]$ReviewerEmails,
     [Int]$MaxWaitMinutes = 30,
-    [Switch]$DeleteAD,
-    [Switch]$WhatIf
+    [Bool]$DeleteAD = $false,
+    [Bool]$Archive = $true,
+    [String]$RedirectEmail ,
+    [Bool]$RedirectExternal = $false,
+    [Bool]$DeliverToMailboxAndForward = $true
 )
 
 
@@ -80,13 +100,20 @@ function Test-ValidEmail {
     $emailPattern = '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     return $Email -match $emailPattern
 }
-@($Email) + $FullAccessEmails + $ReviewerEmails | % {
+@($Email) + $FullAccessEmails + $ReviewerEmails + @($RedirectEmail) | % {
     if ([string]::IsNullOrWhiteSpace($_)) { return }
     if(-not (Test-ValidEmail -Email $_)) {
         throw "Invalid email address: $_"
     }
 }
-
+if($Archive) {
+    try {
+        Get-Mailbox -ResultSize 1 -ErrorAction Stop | Out-Null
+    }
+    catch {
+        throw "Not connected to Exchange Online"
+    }
+}
 
 #┌───────────────┐
 #│   UTILITIES   │
@@ -109,6 +136,38 @@ function Check-MailboxExists {
         return $false
     }
 }
+
+# Archive utilities
+function Get-MailboxProxyAddresses {
+    param (
+        [String]$Email
+    )
+    $encodedEmail = [System.Web.HttpUtility]::UrlEncode($Email)
+    try {
+        return (Get-Mailbox -Identity $Email).EmailAddresses
+    }
+    catch {
+        return (Get-Mailbox -SoftDeletedMailbox -Identity $Email).EmailAddresses
+    }
+}
+function Delete-ADUserFromEmail {
+    param (
+        [String]$Email
+    )
+    $user = Get-ADUser -Filter {Mail -eq $Email}
+    if($user -eq $null) {
+        Write-Warning "No user found in AD with email $Email."
+        return
+    }
+    $children = Get-ADObject -Filter 'ObjectClass -ne "user"' -SearchBase (Get-ADUser $user).DistinguishedName
+    if($children -and $children.Count -gt 0) {
+        Write-Host "User with email $Email has the following children in Active Directory:"
+        $children | ForEach-Object { Write-Host "    - $_" }
+    }
+    if($PSCmdlet.ShouldProcess("$($user.SamAccountName)", "Remove AD user")) {
+        Remove-ADUser -Identity $user -Confirm:$false
+    }
+}
 function Wait-UserDeletionExchange {
     param (
         [String]$Email,
@@ -121,7 +180,7 @@ function Wait-UserDeletionExchange {
     do {
         $userExists = $false
         try {
-            Get-MailBox -Identity $Email -ErrorAction Stop
+            Get-Mailbox -Identity $Email -ErrorAction Stop
             $userExists = $true
         }
         catch {}
@@ -138,131 +197,140 @@ function Wait-UserDeletionExchange {
     Write-Host "Timeout waiting for Exchange user deletion."
     return $false
 }
-function RequestEXO-UserProxyAddresses {
+function Add-FullAccessPermission {
     param (
         [String]$Email,
-        [String]$ProxyFilter
+        [String[]]$FullAccessEmails
     )
-    $encodedEmail = [System.Web.HttpUtility]::UrlEncode($Email)
-    $proxyAddresses = (Get-Mailbox -Identity $Email).EmailAddresses
-    $proxyAddressesFiltered = $proxyAddresses | Where-Object { $_ -match $ProxyFilter }
-    return $proxyAddressesFiltered
+    if($FullAccessEmails -and $FullAccessEmails.Count -gt 0) {
+        $FullAccessEmails | ForEach-Object {
+            if($PSCmdlet.ShouldProcess("$_", "Grant $Email FullAccess permission")) {
+                Add-MailboxPermission -Identity $Email `
+                                      -User $_ `
+                                      -AccessRights FullAccess `
+                                      -Confirm:$false
+            }
+        }
+    }
 }
-$whatIfPrefix = if($WhatIf) { "WHATIF: " } else { "" }
+function Add-ReviewerPermission {
+    param (
+        [String]$Email,
+        [String[]]$ReviewerEmails
+    )
+    # For reviewer access we need to give folder based permission
+    if($ReviewerEmails -and $ReviewerEmails.Count -gt 0) {
+        $ReviewerEmails | ForEach-Object {
+            $folders = Get-MailboxFolderStatistics -Identity $Email | Where-Object {$_.FolderType -ne "SearchFolder"}
+            foreach($folder in $folders) {
+                $folderPath = $folder.FolderPath.Replace("/", "\")
+                $identity = "$Email`\:$folderPath" 
+                if($PSCmdlet.ShouldProcess("$_", "Grant $Email Reviewer permissions")) {
+                    try {
+                        Add-MailboxFolderPermission -Identity $identity `
+                                                    -User $_ `
+                                                    -AccessRights Reviewer `
+                                                    -Confirm:$false
+                    }
+                    catch {
+                        Write-Warning "Failed to set permission on $identity for $_"
+                    }
+                }
+            }
+        }
+    }
+}
+function Restore-OldToNewMailbox {
+    param (
+        [String]$Email
+    )
+    if($PSCmdlet.ShouldProcess("Mailbox $Email", "Restore soft deleted mailbox to new shared email")) {
+        # Get the GUID from the old mailbox and the new mailbox.
+        $deletedEmail = Get-Mailbox -SoftDeletedMailbox -Identity $Email
+        $newEmail = Get-Mailbox -Identity $Email
 
-#┌─────────────┐
-#│ CONNECTIONS │
-#└─────────────┘
-# Exchange Online connection
-Write-Host "Connecting to ExchangeOnline"
-Connect-ExchangeOnline
+        # Restore the old mailbox to the new one.
+        New-MailboxRestoreRequest -SourceMailbox $deletedEmail.ExchangeGuid `
+                                  -TargetMailbox $newEmail.ExchangeGuid `
+                                  -AllowLegacyDNMismatch `
+                                  -Confirm:$false
+    }
+}
+function CreateAndRestore-OldToNewMailbox {
+    param (
+        [String]$Email,
+        [String]$ProxyFilter,
+        [String[]]$FullAccessEmails,
+        [String[]]$ReviewerEmails
+    )
+    # Retrieve proxy addresses.
+    $proxyAddresses = Get-MailboxProxyAddresses -Email $Email | Where-Object { $_ -match $ProxyFilter }
+
+    # Create a new shared mailbox with the old mail.
+    $nameParts = ($Email -split "@")[0] -split "\."
+    $firstName = $nameParts[0]
+    $lastName = $nameParts[1]
+    if($PSCmdlet.ShouldProcess("Mailbox $Email", "Create new shared mailbox")) {
+        New-Mailbox -Shared `
+                    -Name "$firstName $lastName" `
+                    -DisplayName "$firstName $lastName" `
+                    -Alias "$firstName$lastName" `
+                    -PrimarySmtpAddress $Email `
+                    -Confirm:$false
+    }
+
+    # Add proxy addresses to the new shared mailbox.
+    if($PSCmdlet.ShouldProcess("Mailbox $Email", "Add proxy addresses $proxyAddresses")) {
+        Set-Mailbox -Identity $Email `
+                    -EmailAddresses @{add = $proxyAddresses} `
+                    -Confirm:$false
+    }
+
+    # Gives the permission to new owners.
+    Add-FullAccessPermission -Email $Email -FullAccessEmails $FullAccessEmails
+    Add-ReviewerPermission -Email $Email -ReviewerEmails $ReviewerEmails
+
+    # Restore the old mailbox to the new one.
+    Restore-OldToNewMailbox -Email $Email
+}
 
 
 #┌───────────────────┐
 #│    MAIN PROCESS   │
 #└───────────────────┘
-## 1. Request the addresses and apply filter
-Write-Host "Retrieving proxy addresses:"
-$proxyAddresses = @()
-try {
-    $proxyAddresses = RequestEXO-UserProxyAddresses -Email $Email -ProxyFilter $ProxyFilter
-}
-catch {
-    throw "Failed to retrieve user proxy addresses: $($_.Exception.Message)" 
-}
-$proxyAddresses | ForEach-Object { Write-Host "    - $_"}
+# Delete the user from the AD
+if($DeleteAD) { Delete-ADUserFromEmail -Email $Email }
 
-## 2. Delete the user from Active Directory. ##
-if($DeleteAD) {
-    $user = Get-ADUser -Filter {Mail -eq $Email}
-    if ($user) {
-        Write-Output $user
-        if($WhatIf) {
-            Write-Host "WHATIF: Would ask for the deletion of this user."
-        }
-        else {
-            $confirmation = Read-Host "Are you sure you want to delete this user ? [Y/N]"
-            if($confirmation -ne "Y") {
-                throw "Operation cancelled."
-            }
-            else {
-                Remove-ADUser -Identity $user -Confirm:$false
-                Write-Host "AD user with email $Email has been deleted."
-            }
+if($Archive) {
+    # Wait for the user deletion in Exchange
+    if($PSCmdlet.ShouldProcess("Mailbox $Email", "Waiting for the deletion in Exchange")) {
+        Wait-UserDeletionExchange -Email $Email -MaxWaitMinutes $MaxWaitMinutes
+    }
+    
+    # Create a new shared mailbox and restore the deleted singular mailbox to that shared mailbox
+    CreateAndRestore-OldToNewMailbox -Email $Email `
+                                     -ProxyFilter $ProxyFilter `
+                                     -FullAccessEmails $FullAccessEmails `
+                                     -ReviewerEmails $ReviewerEmails `
+}
+
+if($RedirectEmail) {
+    # For external redirection
+    if($RedirectExternal) {
+        if($PSCmdlet.ShouldProcess("Mailbox $Email", "Set external forwarding to $RedirectEmail")) {
+            Set-Mailbox -Identity $Email `
+                        -ForwardingSMTPAddress $RedirectEmail `
+                        -DeliverToMailboxAndForward $DeliverToMailboxAndForward
         }
     }
+    # For same tenant redirection
     else {
-        $confirmation = Read-Host "No user found with email $Email. Do you want to continue ? [Y/N]"
-        if($confirmation -ne "Y") {
-            throw "Operation cancelled."
+        if($PSCmdlet.ShouldProcess("Mailbox $Email", "Set internal forwarding to $RedirectEmail")) {
+            Set-Mailbox -Identity $Email `
+                        -ForwardingAddress $RedirectEmail `
+                        -DeliverToMailboxAndForward $DeliverToMailboxAndForward
         }
     }
 }
 
-## 3. Wait for the user to be deleted from Azure. ##
-Write-Host "$($whatIfPrefix)Waiting for the deletion of the of the user in Exchange"
-if(-not $WhatIf) {
-    Wait-UserDeletionExchange -Email $Email -MaxWaitMinutes $MaxWaitMinutes
-}
-
-## 4. Create a new shared mailbox with the old mail. ##
-$nameParts = ($Email -split "@")[0] -split "\."
-$firstName = $nameParts[0]
-$lastName = $nameParts[1]
-Write-Host "$($whatIfPrefix)Create a new shared mailbox: $firstName $lastName $Email"
-if(-not $WhatIf) {
-    New-Mailbox -Shared -Name "$firstName $lastName" -DisplayName "$($firstName) $($lastName)" -Alias "$($firstName)$($lastName)" -PrimarySmtpAddress $Email
-}
-
-## 5. Add proxy addresses to the new shared mailbox. ##
-Write-Host "$($whatIfPrefix)Add proxy addresses to $Email"
-if(-not $WhatIf) {
-    Set-Mailbox -Identity $Email -EmailAddresses @{add=$proxyAddresses}
-}
-
-## 6. Gives the permission to new owners. ##
-### Giving full acess is easy
-if($FullAccessEmails -and $FullAccessEmails.Count -gt 0) {
-    Write-Host "$($whatIfPrefix)Giving full access permission to:"
-    $FullAccessEmails | ForEach-Object {
-        Write-Host "  $($whatIfPrefix)$_"
-        if(-not $WhatIf) {
-            Add-MailboxPermission -Identity $Email -User $_ -AccessRights FullAccess
-        }
-    }
-}
-
-### For reviewer access we need to give folder based permission
-if($ReviewerEmails -and $ReviewerEmails.Count -gt 0) {
-    Write-Host "$($whatIfPrefix)Giving reviewer permission to:"
-    $ReviewerEmails | Where-Object { $_ -ne $null } | ForEach-Object {
-        Write-Host "  $($whatIfPrefix)$_"
-        $folders = Get-MailboxFolderStatistics -Identity $Email | Where-Object {$_.FolderType -ne "SearchFolder"}
-        foreach($folder in $folders) {
-            $folderPath = $folder.FolderPath.Replace("/", "\")  # Format correctly
-            $identity = "$Email`\:$folderPath" 
-            try {
-                Write-Host "    $($whatIfPrefix)$identity"
-                if(-not $WhatIf) {
-                    Add-MailboxFolderPermission -Identity $identity -User $_ -AccessRights Reviewer
-                }
-            }
-            catch {
-                Write-Warning "Failed to set permission on $identity for $_"
-            }
-        }
-    }
-}
-
-## 7. Get the GUID from the old mailbox and the new mailbox (even though they have the same name you can get both, see the script). ##
-Write-Host "$($whatIfPrefix)Get the GUID of the soft deleted and the new shared mailbox with address: $Email"
-if(-not $WhatIf) {
-    $deletedEmail = Get-Mailbox -SoftDeletedMailbox -Identity $Email
-    $newEmail = Get-Mailbox -Identity $Email
-}
-
-## 8. Restore the old mailbox to the new one. ##
-Write-Host "$($whatIfPrefix)Restore soft deleted mailbox $Email to new mailbox $Email"
-if(-not $WhatIf) {
-    New-MailboxRestoreRequest -SourceMailbox $deletedEmail.ExchangeGuid -TargetMailbox $newEmail.ExchangeGuid -AllowLegacyDNMismatch
-}
+Disconnect-ExchangeOnline -Confirm:$false
