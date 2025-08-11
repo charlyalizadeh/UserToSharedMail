@@ -332,5 +332,3 @@ if($RedirectEmail) {
         }
     }
 }
-
-Disconnect-ExchangeOnline -Confirm:$false
