@@ -2,50 +2,119 @@
 
 ## Description
 
-Transfer the personal mailbox of a deleted user to a shared mailbox.
-The default behavior of Microsoft is to delete the shared mailbox linked to a user if the user is deleted. This scripts allows the shared mailbox to stay active even after the user is deleted.
-NOTE: the user must have been deleted in the last 30 days, during this time he is in a softdeleted state. After that the user no longer exists.
+Script to convert a singular mailbox to a shared one. The Exchange Admin Center offers a way
+to do it but it deletes the shared mailbox if the original user is deleted.
+So to keep the shared mailbox you have to:
 
-To keep the shared mailbox you have to:
-
-1. Request the addresses and filter only the one ending with your domain
-2. Delete the user from Active Directory
-3. Wait for the user to be deleted from Exchange
+1. (Optional) Delete the user from Active Directory
+2. (Optional) Wait for the user to be deleted from Microsoft 365 and Exchange
+3. Request the proxy addresses
 4. Create a new shared mailbox with the old mail
 5. Add proxy addresses to the new shared mailbox
-6. Assigns permissions to new owners/reviewer
-7. Get the GUID from the old mailbox and the new mailbox (even though they have the same name you can get both, see the script)
-8. Restore the old mailbox to the new one
+6. Assigns permissions to new owners
+7. Restore the old mailbox to the new one
 
-## Setup to run as a user
 
-If you run this script as user the only thing you need is to have the correct right on Microsft Entra ID (and Active Directory if you want the script to also delete the user from the AD).
+## Setup
 
-| Component        | Scope | Role                   | Permissions                                                   |
-|------------------|-------|------------------------|---------------------------------------------------------------|
-| Active Directory | User  | Domain Administrator   | Delete a user from Active Directory                           |
-| Entra ID         | User  | Exchange Administrator | Create shared mailbox and manage proxy addresses, permissions |
+Steps:
+1. Register the application in Entra ID and assign the correct API permissions
+2. Create the certificates and add them to Entra ID
+3. Create a service principal in **Exchange** linked to the service principal in Entra ID (the one in entra should be automatically created after step 1)
+4. Assign the right management role
+
+
+### 1. Register the application in Entra ID and assign the correct API permissions
+
+For this app to work you need to setup it in Entra ID(Azure AD) and Exchange:
+1. Go to [Microsoft Entra admin center](https://entra.microsoft.com/)
+2. `App registrations`
+3. `New registration`
+4. Enter the desired application name (it should be UserToSharedMail for better clarity) then press `Register`
+
+To give the right permission to our app go to the application page in Entra:
+1. `API permissions`
+3. `Add a permission` -> `APIs my organization uses` -> `Office 365 Exchange Online` -> `Application permissions` -> `Exchange.ManageAsApp` -> `Add permissions`
+
+If you have the `Application Administrator` rights in Entra (or `Global Administrator`) you can grant the permission yourself by clicking `Grant admin consent for axeria-iard.fr`.
+If not you have to ask an administrator for consent.
+
+
+### 2. Create the certificates and add them to Entra ID
+
+To create the app certificates you need to run some PowerShell code and upload it to Entra:
+```powershell
+$cert = New-SelfSignedCertificate -Subject "CN=UserToSharedMailCertificate" `
+                                  -CertStoreLocation "Cert:\CurrentUser\My" `
+                                  -KeyExportPolicy Exportable `
+                                  -KeySpec Signature `
+                                  -KeyLength 2048 `
+                                  -NotAfter (Get-Date).AddYears(3)
+Export-Certificate -Cert $cert `
+                   -FilePath "$env:USERPROFILE\Documents\ExchangeOnlineAutomation.cer"
+Export-PfxCertificate -Cert $cert `
+                      -FilePath "$env:USERPROFILE\Documents\ExchangeOnlineAutomation.pfx" `
+                      -Password (Read-Host -AsSecureString)
+```
+
+Then go to the app page in Entra ID:
+1. `Certificates & secrets`
+2. `Certificates`
+3. `Upload certificate`
+4. Select the `.cer` file in your `Documents`
+
+
+### 3. Create a service principal in Exchange linked to the service principal in Entra ID
+
+1. Go to [Microsoft Entra admin center](https://entra.microsoft.com/)
+2. `Enterprise apps`
+3. Search for the application name (`UserToSharedMail`)
+4. Run (as an `Exchange Administrator`):
+```powershell
+New-ServicePrincipal -AppId <Application ID> -ObjectId <Object ID> -DisplayName <Name>`
+```
+
+
+### 4. Assign the right management role
+
+Run (as an `Exchange Administrator`):
+```powershell
+# Get-Mailbox, New-Mailbox, Set-Mailbox
+New-ManagementRoleAssignment -App <Application ID> -Role "Mail Recipients"
+# Add-MailboxPermission, Add-MailboxFolderPermission
+New-ManagementRoleAssignment -App <Application ID> -Role "Mail Recipients Creation"
+# New-MailboxRestoreRequest
+New-ManagementRoleAssignment -App <Application ID> -Role "Mail Import Export"
+```
 
 
 ## Running
 
+### As a user
+
 ```powershell
-.\UserToSharedMail -Email prenom.nom@domain.com `
-                   -ProxyFilter "^(smtp:|SMTP:).*@domain\.(com|fr)" `
-                   -FullAccessEmails a.b@domain.com, c.d@domain.com `
-                   -ReviewerEmails e.f@domain.com, g.h@domain.com `
-                   -MaxWaitMinutes 30 `
-                   -DeleteAD `
+Connect-ExchangeOnline
+.\UserToSharedMail.ps1 -Email example@domain.fr `
+                       -ProxyFilter "^(smtp:|SMTP:).*@domain\.(fr|com)" `
+                       -FullAccessEmails redirection1@domain.fr,redirection2@domain.fr `
+                       -ReviewerEmails rewiewer1@domain.fr,rewiewer2@domain.com `
+                       -DeleteAD $False `
+                       -Archive $True
+Disconnect-ExchangeOnline -Confirm:$false
 ```
 
-You can use the `-WhatIf` parameter to see what the would do:
+### As an application
 
 ```powershell
-.\UserToSharedMail -Email prenom.nom@domain.com `
-                   -ProxyFilter "^(smtp:|SMTP:).*@domain\.(com|fr)" `
-                   -FullAccessEmails a.b@domain.com, c.d@domain.com `
-                   -ReviewerEmails e.f@domain.com, g.h@domain.com `
-                   -MaxWaitMinutes 30 `
-                   -DeleteAD `
-                   -WhatIf
+$certificate = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.Subject -like "CN=UserToSharedMailCertificate" } # or a different name depending of how you called your certificate
+Connect-ExchangeOnline -AppId <Application ID> `
+                       -CertificateThumbprint $certificate.Thumbprint `
+                       -Organization "<domain>.onmicrosoft.com"
+.\UserToSharedMail.ps1 -Email example@domain.fr `
+                       -ProxyFilter "^(smtp:|SMTP:).*@domain\.(fr|com)" `
+                       -FullAccessEmails redirection1@domain.fr,redirection2@domain.fr `
+                       -ReviewerEmails rewiewer1@domain.fr,rewiewer2@domain.com `
+                       -DeleteAD $False `
+                       -Archive $True
+Disconnect-ExchangeOnline -Confirm:$false
 ```
